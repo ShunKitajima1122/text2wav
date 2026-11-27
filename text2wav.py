@@ -10,7 +10,7 @@ Run setup_voicevox.py once to install the local VOICEVOX Core dependencies.
 
 import argparse
 from decimal import Decimal, ROUND_HALF_UP
-from functools import partial
+from functools import lru_cache, partial
 import io
 import json
 import math
@@ -35,6 +35,31 @@ DURATION = re.compile(r"([0-9]+(?:\.[0-9]+)?)(ms|s)")
 MAX_WAV_FRAMES = (0xFFFFFFFF - 36) // 2
 DEFAULT_VOICES = {"男1": 11, "男2": 13, "女1": 2, "女2": 8}
 DEFAULT_CORE_DIR = Path(__file__).resolve().parent / "voicevox_core"
+TALK_STYLE_TYPES = ("talk", "streaming_talk")
+
+
+class SpeakerStyle(NamedTuple):
+    character: str
+    style: str
+
+    @property
+    def label(self):
+        return f"{self.character}（{self.style}）"
+
+
+def speaker_labels(speakers):
+    labels = {}
+    default_styles = {}
+    for style_id, speaker in sorted(speakers.items()):
+        labels.setdefault(speaker.label, style_id)
+        priority = {"ノーマル": 0, "ふつう": 1}.get(speaker.style, 2)
+        candidate = (priority, style_id)
+        previous = default_styles.get(speaker.character)
+        if previous is None or candidate < previous:
+            default_styles[speaker.character] = candidate
+    for character, (_, style_id) in default_styles.items():
+        labels.setdefault(character, style_id)
+    return labels
 
 
 class Speech(NamedTuple):
@@ -81,7 +106,7 @@ def voice_assignment(value):
     raise argparse.ArgumentTypeError("話者は ラベル=ID の形式で指定してください。例: 司会=11")
 
 
-def script_actions(script, speaker, voices):
+def script_actions(script, speaker, voices, find_voice=None):
     parts = COMMAND.split(script)
     previous_was_speech = False
     silence_frames = 0
@@ -106,10 +131,13 @@ def script_actions(script, speaker, voices):
                 raise ValueError("無音の合計時間がWAV形式の上限を超えています。")
             yield Silence(frames)
             previous_was_speech = False
-        elif command in voices:
-            speaker = voices[command]
         else:
-            raise ValueError(f"未定義のコマンド《{command}》です。話者名、秒数（1s）、またはミリ秒数（5ms）を指定してください。")
+            style_id = voices.get(command)
+            if style_id is None and find_voice is not None:
+                style_id = find_voice(command)
+            if style_id is None:
+                raise ValueError(f"未定義のコマンド《{command}》です。話者名、秒数（1s）、またはミリ秒数（5ms）を指定してください。")
+            speaker = style_id
 
 
 def request(engine, path, params=None, body=None, post=False):
@@ -140,10 +168,10 @@ def request(engine, path, params=None, body=None, post=False):
 def fetch_speakers(engine):
     speakers = json.loads(request(engine, "/speakers"))
     return {
-        style["id"]: f'{speaker["name"]}（{style["name"]}）'
+        style["id"]: SpeakerStyle(speaker["name"], style["name"])
         for speaker in speakers
         for style in speaker["styles"]
-        if style.get("type", "talk") == "talk"
+        if style.get("type", "talk") in TALK_STYLE_TYPES
     }
 
 
@@ -195,8 +223,8 @@ class CoreVoice:
                 with VoiceModelFile.open(path) as model:
                     for character in model.metas:
                         for style in character.styles:
-                            if style.type in ("talk", "streaming_talk"):
-                                self.speakers[style.id] = f"{character.name}（{style.name}）"
+                            if style.type in TALK_STYLE_TYPES:
+                                self.speakers[style.id] = SpeakerStyle(character.name, style.name)
                                 self.model_paths[style.id] = path
             except self.model_errors as error:
                 raise RuntimeError(f"音声モデルを確認できません ({path})。{error}") from error
@@ -317,7 +345,7 @@ def main():
         help="原稿内の話者ラベルにスタイルIDを割り当てる。複数指定可",
     )
     parser.add_argument("--speed", type=float, default=1.0, help="読み上げ速度。既定値は1.0")
-    parser.add_argument("--list-speakers", action="store_true", help="利用できる話者を表示")
+    parser.add_argument("--list-speakers", action="store_true", help="利用できる話者スタイルID、名前、原稿用ラベルを表示")
     parser.add_argument("--credit", action="store_true", help="番組末尾に音声クレジットを追加")
     args = parser.parse_args()
     if not args.list_speakers and args.script is None:
@@ -325,20 +353,40 @@ def main():
     if not math.isfinite(args.speed) or not 0.5 <= args.speed <= 2.0:
         parser.error("--speed は 0.5 から 2.0 の間で指定してください。")
 
+    voices = DEFAULT_VOICES.copy()
+    voices.update(args.voice)
+
+    @lru_cache(maxsize=1)
+    def load_speakers():
+        if args.engine:
+            return fetch_speakers(args.engine), None
+        core = CoreVoice(args.core_dir)
+        return core.speakers, core
+
+    @lru_cache(maxsize=1)
+    def labels():
+        speakers, _ = load_speakers()
+        return speaker_labels(speakers)
+
+    def find_voice(command):
+        return labels().get(command)
+
     try:
         if args.list_speakers:
-            speakers = fetch_speakers(args.engine) if args.engine else CoreVoice(args.core_dir).speakers
-            for style_id, name in sorted(speakers.items()):
-                print(f"{style_id}\t{name}")
+            speakers, _ = load_speakers()
+            by_style = {}
+            for label, style_id in {**labels(), **voices}.items():
+                by_style.setdefault(style_id, []).append(f"《{label}》")
+            for style_id, speaker in sorted(speakers.items()):
+                commands = " ".join(by_style.get(style_id, []))
+                print(f"{style_id}\t{speaker.label}\t{commands}")
             return 0
         script = (
             sys.stdin.buffer.read().decode("utf-8-sig") if args.script == "-"
             else Path(args.script).read_text(encoding="utf-8-sig")
         )
         script = script.replace("\r\n", "\n").replace("\r", "\n")
-        voices = DEFAULT_VOICES.copy()
-        voices.update(args.voice)
-        actions = list(script_actions(script, args.speaker, voices))
+        actions = list(script_actions(script, args.speaker, voices, find_voice))
         used_speakers = list(dict.fromkeys(action.speaker for action in actions if isinstance(action, Speech)))
         if not used_speakers and not any(isinstance(action, Silence) and action.frames for action in actions):
             raise ValueError("原稿に読み上げる文章または正の無音時間を指定してください。")
@@ -353,23 +401,21 @@ def main():
         core = None
         synthesize = None
         if used_speakers:
+            speakers, core = load_speakers()
             if args.engine:
-                speakers = fetch_speakers(args.engine)
                 synthesize = partial(synthesize_with_engine, args.engine)
             else:
-                core = CoreVoice(args.core_dir)
-                speakers = core.speakers
                 synthesize = core.synthesize
         for speaker in used_speakers:
             if speaker not in speakers:
                 raise ValueError(f"話者ID {speaker} は利用できません。--list-speakers で確認してください。")
         if core is not None:
             core.prepare(used_speakers)
-        names = dict.fromkeys(speakers[speaker].split("（", 1)[0] for speaker in used_speakers)
+        names = dict.fromkeys(speakers[speaker].character for speaker in used_speakers)
         if args.credit and used_speakers:
             text = f"音声合成は、ボイスボックスの、{'、'.join(names)}を使用しました。"
             actions.append(Speech(text, isinstance(actions[-1], Speech), used_speakers[0]))
-        credit = "、".join(speakers[speaker] for speaker in used_speakers)
+        credit = "、".join(speakers[speaker].label for speaker in used_speakers)
         write_episode(output, actions, synthesize, args.speed, credit)
         return 0
     except (OSError, ValueError, RuntimeError, EOFError, wave.Error) as error:
