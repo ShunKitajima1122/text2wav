@@ -30,7 +30,7 @@ UTF-8の日本語原稿をVOICEVOXで読み上げ、ポッドキャスト用のW
 python podcast_to_wav.py script.txt
 ```
 
-`script.txt` と同じディレクトリに `script.wav` が生成されます。出力形式はモノラル、44.1 kHz、16-bit PCMです。環境に合わせて `python3` や `uv run` でも実行できます。
+`script.txt` と同じディレクトリに `script.wav` が生成されます（モノラル、44.1 kHz、16-bit PCM）。
 
 出力先、話者、速度を指定する例です。出力先にディレクトリを指定する場合は、先に作成してください。
 
