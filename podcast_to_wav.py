@@ -26,6 +26,8 @@ import wave
 SAMPLE_RATE = 44100
 MAX_CHARS = 200
 SENTENCE_END = re.compile(r'[。！？!?]+[」』）】”’]*')
+SPEAKER_LABEL = re.compile(r"^[ \t]*【([^【】\n]+)】[ \t]*[：:][ \t]*", re.MULTILINE)
+DEFAULT_VOICES = {"男1": 11, "男2": 13, "女1": 2, "女2": 8}
 
 
 def script_chunks(script):
@@ -51,6 +53,26 @@ def script_chunks(script):
                 yield chunk, first and paragraph_index > 0
                 first = False
             start = end
+
+
+def voice_assignment(value):
+    label, separator, style = value.partition("=")
+    label = label.strip()
+    if separator and re.fullmatch(r"[^【】\r\n]+", label) and re.fullmatch(r"[0-9]+", style.strip()):
+        return label, int(style)
+    raise argparse.ArgumentTypeError("話者は ラベル=ID の形式で指定してください。例: 司会=11")
+
+
+def dialogue_chunks(script, default_speaker, voices):
+    parts = [""] + SPEAKER_LABEL.split(script)
+    has_audio = False
+    for label, turn in zip(parts[::2], parts[1::2]):
+        if label and label.strip() not in voices:
+            raise ValueError(f"話者ラベル「{label.strip()}」は未定義です。--voice ラベル=ID で指定してください。")
+        speaker = voices[label.strip()] if label else default_speaker
+        for index, (chunk, pause) in enumerate(script_chunks(turn)):
+            yield chunk, pause or (index == 0 and has_audio), speaker
+            has_audio = True
 
 
 def request(engine, path, params=None, body=None, post=False):
@@ -102,7 +124,7 @@ def synthesize(engine, speaker, speed, text):
     return request(engine, "/synthesis", {"speaker": speaker}, body=query, post=True)
 
 
-def write_episode(output, chunks, engine, speaker, speed, credit):
+def write_episode(output, chunks, engine, speed, credit):
     silence = bytes(round(SAMPLE_RATE * 0.35) * 2)
     temporary = None
     try:
@@ -112,7 +134,7 @@ def write_episode(output, chunks, engine, speaker, speed, credit):
             temporary = Path(file.name)
             with wave.open(file, "wb") as episode:
                 episode.setparams((1, 2, SAMPLE_RATE, 0, "NONE", "not compressed"))
-                for index, (chunk, pause) in enumerate(chunks, start=1):
+                for index, (chunk, pause, speaker) in enumerate(chunks, start=1):
                     print(f"音声合成 {index}/{len(chunks)}", file=sys.stderr)
                     with wave.open(io.BytesIO(synthesize(engine, speaker, speed, chunk)), "rb") as segment:
                         audio_format = (
@@ -140,6 +162,10 @@ def main():
     parser.add_argument("output", nargs="?", type=Path, help="WAVのパス。省略時は原稿と同名")
     parser.add_argument("--engine", default="http://127.0.0.1:50021", help="VOICEVOX EngineのURL")
     parser.add_argument("--speaker", type=int, default=2, help="話者スタイルID。既定値は2")
+    parser.add_argument(
+        "--voice", action="append", type=voice_assignment, default=[], metavar="ラベル=ID",
+        help="原稿内の話者ラベルにスタイルIDを割り当てる。複数指定可",
+    )
     parser.add_argument("--speed", type=float, default=1.0, help="読み上げ速度。既定値は1.0")
     parser.add_argument("--list-speakers", action="store_true", help="利用できる話者を表示")
     parser.add_argument("--credit", action="store_true", help="番組末尾に音声クレジットを追加")
@@ -158,7 +184,10 @@ def main():
             sys.stdin.buffer.read().decode("utf-8-sig") if args.script == "-"
             else Path(args.script).read_text(encoding="utf-8-sig")
         )
-        chunks = list(script_chunks(script.replace("\r\n", "\n").replace("\r", "\n")))
+        script = script.replace("\r\n", "\n").replace("\r", "\n")
+        voices = DEFAULT_VOICES.copy()
+        voices.update(args.voice)
+        chunks = list(dialogue_chunks(script, args.speaker, voices))
         if not chunks:
             raise ValueError("原稿が空です。")
         output = args.output
@@ -169,12 +198,16 @@ def main():
         if args.script != "-" and output.resolve() == Path(args.script).resolve():
             raise ValueError("原稿と異なる出力先を指定してください。")
         speakers = fetch_speakers(args.engine)
-        if args.speaker not in speakers:
-            raise ValueError(f"話者ID {args.speaker} は利用できません。--list-speakers で確認してください。")
-        speaker_name = speakers[args.speaker]
+        used_speakers = list(dict.fromkeys(speaker for _, _, speaker in chunks))
+        for speaker in used_speakers:
+            if speaker not in speakers:
+                raise ValueError(f"話者ID {speaker} は利用できません。--list-speakers で確認してください。")
+        names = dict.fromkeys(speakers[speaker].split("（", 1)[0] for speaker in used_speakers)
         if args.credit:
-            chunks.append((f"音声合成は、ボイスボックスの、{speaker_name.split('（', 1)[0]}を使用しました。", True))
-        write_episode(output, chunks, args.engine, args.speaker, args.speed, speaker_name)
+            text = f"音声合成は、ボイスボックスの、{'、'.join(names)}を使用しました。"
+            chunks.append((text, True, used_speakers[0]))
+        credit = "、".join(speakers[speaker] for speaker in used_speakers)
+        write_episode(output, chunks, args.engine, args.speed, credit)
         return 0
     except (OSError, ValueError, RuntimeError, EOFError, wave.Error) as error:
         print(f"エラー　{error}", file=sys.stderr)
