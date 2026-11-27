@@ -3,9 +3,9 @@
 
 Start the VOICEVOX editor or Engine before running this script.
 
-    python podcast_to_wav.py script.txt
-    python podcast_to_wav.py script.txt episode.wav --speaker 2 --speed 1.05
-    python podcast_to_wav.py --list-speakers
+    python text2wav.py script.txt
+    python text2wav.py script.txt episode.wav --speaker 2 --speed 1.05
+    python text2wav.py --list-speakers
 """
 
 import argparse

@@ -10,7 +10,7 @@ UTF-8の日本語原稿をVOICEVOXで読み上げ、ポッドキャスト用のW
 
 ### `script.txt` の例
 
-次の文章をコピーし、`podcast_to_wav.py` と同じディレクトリに `script.txt` として保存します。
+次の文章をコピーし、`text2wav.py` と同じディレクトリに `script.txt` として保存します。
 
 ```text
 こんにちは。週刊テックニュースのサンプルです。今日は、ゲーム開発とパソコンの省電力についてお話しします。
@@ -27,7 +27,7 @@ UTF-8の日本語原稿をVOICEVOXで読み上げ、ポッドキャスト用のW
 リポジトリのディレクトリで実行します。
 
 ```sh
-python podcast_to_wav.py script.txt
+python text2wav.py script.txt
 ```
 
 `script.txt` と同じディレクトリに `script.wav` が生成されます（モノラル、44.1 kHz、16-bit PCM）。
@@ -35,13 +35,13 @@ python podcast_to_wav.py script.txt
 出力先、話者、速度を指定する例です。出力先にディレクトリを指定する場合は、先に作成してください。
 
 ```sh
-python podcast_to_wav.py script.txt episode.wav --speaker 2 --speed 1.05
+python text2wav.py script.txt episode.wav --speaker 2 --speed 1.05
 ```
 
 話者スタイルIDは次のコマンドで確認できます。
 
 ```sh
-python podcast_to_wav.py --list-speakers
+python text2wav.py --list-speakers
 ```
 
 ## 原稿で話者と無音を指定する
@@ -72,7 +72,7 @@ python podcast_to_wav.py --list-speakers
 `--voice` を使うと、既定の割り当てを変更したり、`《司会》` のような独自の名前を使ったりできます。以前の `【男1】：` 形式を使った原稿は `《男1》` 形式に書き換えてください。
 
 ```sh
-python podcast_to_wav.py script.txt --voice "司会=11" --voice "解説=8"
+python text2wav.py script.txt --voice "司会=11" --voice "解説=8"
 ```
 
 ## 標準入力で渡す
@@ -80,7 +80,7 @@ python podcast_to_wav.py script.txt --voice "司会=11" --voice "解説=8"
 Bashなどでは、原稿をUTF-8の標準入力から渡せます。入力に `-` を指定し、出力先を省略すると `podcast.wav` が生成されます。
 
 ```sh
-python podcast_to_wav.py - episode.wav < script.txt
+python text2wav.py - episode.wav < script.txt
 ```
 
 ## オプション
