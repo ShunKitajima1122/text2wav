@@ -9,6 +9,7 @@ Start the VOICEVOX editor or Engine before running this script.
 """
 
 import argparse
+from decimal import Decimal, ROUND_HALF_UP
 import io
 import json
 import math
@@ -17,6 +18,7 @@ from pathlib import Path
 import re
 import sys
 import tempfile
+from typing import NamedTuple
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
@@ -26,8 +28,20 @@ import wave
 SAMPLE_RATE = 44100
 MAX_CHARS = 200
 SENTENCE_END = re.compile(r'[。！？!?]+[」』）】”’]*')
-SPEAKER_LABEL = re.compile(r"^[ \t]*【([^【】\n]+)】[ \t]*[：:][ \t]*", re.MULTILINE)
+COMMAND = re.compile(r"《([^《》\r\n]*)》")
+DURATION = re.compile(r"([0-9]+(?:\.[0-9]+)?)(ms|s)")
+MAX_WAV_FRAMES = (0xFFFFFFFF - 36) // 2
 DEFAULT_VOICES = {"男1": 11, "男2": 13, "女1": 2, "女2": 8}
+
+
+class Speech(NamedTuple):
+    text: str
+    paragraph_pause: bool
+    speaker: int
+
+
+class Silence(NamedTuple):
+    frames: int
 
 
 def script_chunks(script):
@@ -58,21 +72,41 @@ def script_chunks(script):
 def voice_assignment(value):
     label, separator, style = value.partition("=")
     label = label.strip()
-    if separator and re.fullmatch(r"[^【】\r\n]+", label) and re.fullmatch(r"[0-9]+", style.strip()):
+    if (separator and re.fullmatch(r"[^《》\r\n]+", label)
+            and not DURATION.fullmatch(label) and re.fullmatch(r"[0-9]+", style.strip())):
         return label, int(style)
     raise argparse.ArgumentTypeError("話者は ラベル=ID の形式で指定してください。例: 司会=11")
 
 
-def dialogue_chunks(script, default_speaker, voices):
-    parts = [""] + SPEAKER_LABEL.split(script)
-    has_audio = False
-    for label, turn in zip(parts[::2], parts[1::2]):
-        if label and label.strip() not in voices:
-            raise ValueError(f"話者ラベル「{label.strip()}」は未定義です。--voice ラベル=ID で指定してください。")
-        speaker = voices[label.strip()] if label else default_speaker
-        for index, (chunk, pause) in enumerate(script_chunks(turn)):
-            yield chunk, pause or (index == 0 and has_audio), speaker
-            has_audio = True
+def script_actions(script, speaker, voices):
+    parts = COMMAND.split(script)
+    previous_was_speech = False
+    silence_frames = 0
+    for index, part in enumerate(parts):
+        if index % 2 == 0:
+            if "《" in part or "》" in part:
+                raise ValueError("原稿のコマンドは同じ行の《》で囲んでください。")
+            for chunk_index, (chunk, paragraph_pause) in enumerate(script_chunks(part)):
+                pause = paragraph_pause or (chunk_index == 0 and previous_was_speech)
+                yield Speech(chunk, pause, speaker)
+                previous_was_speech = True
+            continue
+
+        command = part.strip()
+        duration = DURATION.fullmatch(command)
+        if duration:
+            amount, unit = duration.groups()
+            seconds = Decimal(amount) / (1000 if unit == "ms" else 1)
+            frames = int((seconds * SAMPLE_RATE).to_integral_value(rounding=ROUND_HALF_UP))
+            silence_frames += frames
+            if silence_frames > MAX_WAV_FRAMES:
+                raise ValueError("無音の合計時間がWAV形式の上限を超えています。")
+            yield Silence(frames)
+            previous_was_speech = False
+        elif command in voices:
+            speaker = voices[command]
+        else:
+            raise ValueError(f"未定義のコマンド《{command}》です。話者名、秒数（1s）、またはミリ秒数（5ms）を指定してください。")
 
 
 def request(engine, path, params=None, body=None, post=False):
@@ -110,7 +144,7 @@ def fetch_speakers(engine):
     }
 
 
-def synthesize(engine, speaker, speed, text):
+def synthesize(engine, speaker, speed, text, *, pad_start=True, pad_end=True):
     query = json.loads(request(
         engine, "/audio_query", {"speaker": speaker, "text": text}, post=True
     ))
@@ -118,14 +152,22 @@ def synthesize(engine, speaker, speed, text):
         speedScale=speed,
         outputSamplingRate=SAMPLE_RATE,
         outputStereo=False,
-        prePhonemeLength=0.06,
-        postPhonemeLength=0.16,
+        prePhonemeLength=0.06 if pad_start else 0.0,
+        postPhonemeLength=0.16 if pad_end else 0.0,
     )
     return request(engine, "/synthesis", {"speaker": speaker}, body=query, post=True)
 
 
-def write_episode(output, chunks, engine, speed, credit):
-    silence = bytes(round(SAMPLE_RATE * 0.35) * 2)
+def write_silence(episode, frames):
+    block = bytes(min(frames, SAMPLE_RATE) * 2)
+    whole_seconds, remainder = divmod(frames, SAMPLE_RATE)
+    for _ in range(whole_seconds):
+        episode.writeframesraw(block)
+    if remainder:
+        episode.writeframesraw(block[:remainder * 2])
+
+
+def write_episode(output, actions, engine, speed, credit):
     temporary = None
     try:
         with tempfile.NamedTemporaryFile(
@@ -134,21 +176,31 @@ def write_episode(output, chunks, engine, speed, credit):
             temporary = Path(file.name)
             with wave.open(file, "wb") as episode:
                 episode.setparams((1, 2, SAMPLE_RATE, 0, "NONE", "not compressed"))
-                for index, (chunk, pause, speaker) in enumerate(chunks, start=1):
-                    print(f"音声合成 {index}/{len(chunks)}", file=sys.stderr)
-                    with wave.open(io.BytesIO(synthesize(engine, speaker, speed, chunk)), "rb") as segment:
+                for index, action in enumerate(actions):
+                    if isinstance(action, Silence):
+                        write_silence(episode, action.frames)
+                        continue
+                    print(f"区間 {index + 1}/{len(actions)} を音声合成", file=sys.stderr)
+                    audio = synthesize(
+                        engine, action.speaker, speed, action.text,
+                        pad_start=index == 0 or not isinstance(actions[index - 1], Silence),
+                        pad_end=index + 1 == len(actions) or not isinstance(actions[index + 1], Silence),
+                    )
+                    with wave.open(io.BytesIO(audio), "rb") as segment:
                         audio_format = (
                             segment.getnchannels(), segment.getsampwidth(), segment.getframerate()
                         )
                         frames = segment.readframes(segment.getnframes())
                         if (audio_format != (1, 2, SAMPLE_RATE) or not frames
                                 or len(frames) != segment.getnframes() * 2):
-                            raise ValueError(f"区間 {index} のWAVが空か、形式が異なります。")
-                        if pause:
-                            episode.writeframesraw(silence)
+                            raise ValueError(f"区間 {index + 1} のWAVが空か、形式が異なります。")
+                        if action.paragraph_pause:
+                            write_silence(episode, round(SAMPLE_RATE * 0.35))
                         episode.writeframesraw(frames)
         os.replace(temporary, output)
-        print(f"{output}\n音声クレジット　VOICEVOX:{credit}", file=sys.stderr)
+        print(output, file=sys.stderr)
+        if credit:
+            print(f"音声クレジット　VOICEVOX:{credit}", file=sys.stderr)
     finally:
         if temporary is not None:
             temporary.unlink(missing_ok=True)
@@ -187,9 +239,10 @@ def main():
         script = script.replace("\r\n", "\n").replace("\r", "\n")
         voices = DEFAULT_VOICES.copy()
         voices.update(args.voice)
-        chunks = list(dialogue_chunks(script, args.speaker, voices))
-        if not chunks:
-            raise ValueError("原稿が空です。")
+        actions = list(script_actions(script, args.speaker, voices))
+        used_speakers = list(dict.fromkeys(action.speaker for action in actions if isinstance(action, Speech)))
+        if not used_speakers and not any(isinstance(action, Silence) and action.frames for action in actions):
+            raise ValueError("原稿に読み上げる文章または正の無音時間を指定してください。")
         output = args.output
         if output is None:
             output = Path("podcast.wav") if args.script == "-" else Path(args.script).with_suffix(".wav")
@@ -197,17 +250,16 @@ def main():
             raise ValueError("出力ファイルの拡張子は .wav にしてください。")
         if args.script != "-" and output.resolve() == Path(args.script).resolve():
             raise ValueError("原稿と異なる出力先を指定してください。")
-        speakers = fetch_speakers(args.engine)
-        used_speakers = list(dict.fromkeys(speaker for _, _, speaker in chunks))
+        speakers = fetch_speakers(args.engine) if used_speakers else {}
         for speaker in used_speakers:
             if speaker not in speakers:
                 raise ValueError(f"話者ID {speaker} は利用できません。--list-speakers で確認してください。")
         names = dict.fromkeys(speakers[speaker].split("（", 1)[0] for speaker in used_speakers)
-        if args.credit:
+        if args.credit and used_speakers:
             text = f"音声合成は、ボイスボックスの、{'、'.join(names)}を使用しました。"
-            chunks.append((text, True, used_speakers[0]))
+            actions.append(Speech(text, isinstance(actions[-1], Speech), used_speakers[0]))
         credit = "、".join(speakers[speaker] for speaker in used_speakers)
-        write_episode(output, chunks, args.engine, args.speed, credit)
+        write_episode(output, actions, args.engine, args.speed, credit)
         return 0
     except (OSError, ValueError, RuntimeError, EOFError, wave.Error) as error:
         print(f"エラー　{error}", file=sys.stderr)
