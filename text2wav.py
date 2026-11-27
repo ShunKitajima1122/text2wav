@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 """Convert a UTF-8 Japanese podcast script to one WAV using VOICEVOX.
 
-Start the VOICEVOX editor or Engine before running this script.
+Run setup_voicevox.py once to install the local VOICEVOX Core dependencies.
 
-    python text2wav.py script.txt
-    python text2wav.py script.txt episode.wav --speaker 2 --speed 1.05
-    python text2wav.py --list-speakers
+    uv run text2wav.py script.txt
+    uv run text2wav.py script.txt episode.wav --speaker 2 --speed 1.05
+    uv run text2wav.py --list-speakers
 """
 
 import argparse
 from decimal import Decimal, ROUND_HALF_UP
+from functools import partial
 import io
 import json
 import math
@@ -26,12 +27,14 @@ import wave
 
 
 SAMPLE_RATE = 44100
+CORE_SAMPLE_RATE = 24000
 MAX_CHARS = 200
 SENTENCE_END = re.compile(r'[。！？!?]+[」』）】”’]*')
 COMMAND = re.compile(r"《([^《》\r\n]*)》")
 DURATION = re.compile(r"([0-9]+(?:\.[0-9]+)?)(ms|s)")
 MAX_WAV_FRAMES = (0xFFFFFFFF - 36) // 2
 DEFAULT_VOICES = {"男1": 11, "男2": 13, "女1": 2, "女2": 8}
+DEFAULT_CORE_DIR = Path(__file__).resolve().parent / "voicevox_core"
 
 
 class Speech(NamedTuple):
@@ -144,7 +147,7 @@ def fetch_speakers(engine):
     }
 
 
-def synthesize(engine, speaker, speed, text, *, pad_start=True, pad_end=True):
+def synthesize_with_engine(engine, speaker, speed, text, *, pad_start=True, pad_end=True):
     query = json.loads(request(
         engine, "/audio_query", {"speaker": speaker, "text": text}, post=True
     ))
@@ -158,6 +161,85 @@ def synthesize(engine, speaker, speed, text, *, pad_start=True, pad_end=True):
     return request(engine, "/synthesis", {"speaker": speaker}, body=query, post=True)
 
 
+class CoreVoice:
+    def __init__(self, data_dir):
+        try:
+            import voicevox_core as core
+            from voicevox_core.blocking import Onnxruntime, OpenJtalk, Synthesizer, VoiceModelFile
+        except ImportError as error:
+            raise RuntimeError(
+                "VOICEVOX Coreを読み込めません。uv run setup_voicevox.py を実行してください。"
+                f" ({error})"
+            ) from error
+
+        self.voice_model_file = VoiceModelFile
+        self.onnxruntime = Onnxruntime
+        self.open_jtalk = OpenJtalk
+        self.synthesizer_type = Synthesizer
+        self.model_errors = (
+            core.OpenZipFileError, core.ReadZipEntryError, core.InvalidModelFormatError,
+            core.InvalidModelDataError, core.ModelAlreadyLoadedError, core.StyleAlreadyLoadedError,
+        )
+        self.runtime_errors = (core.InitInferenceRuntimeError, core.NotLoadedOpenjtalkDictError)
+        self.synthesis_errors = (core.AnalyzeTextError, core.RunModelError, core.StyleNotFoundError)
+        self.data_dir = data_dir.resolve()
+        self.speakers = {}
+        self.model_paths = {}
+        paths = sorted(self.data_dir.glob("models/vvms/*.vvm"))
+        if not paths:
+            raise RuntimeError(
+                f"音声モデルが見つかりません ({self.data_dir})。uv run setup_voicevox.py を実行してください。"
+            )
+        for path in paths:
+            try:
+                with VoiceModelFile.open(path) as model:
+                    for character in model.metas:
+                        for style in character.styles:
+                            if style.type in ("talk", "streaming_talk"):
+                                self.speakers[style.id] = f"{character.name}（{style.name}）"
+                                self.model_paths[style.id] = path
+            except self.model_errors as error:
+                raise RuntimeError(f"音声モデルを確認できません ({path})。{error}") from error
+
+    def prepare(self, speakers):
+        filename = self.onnxruntime.LIB_RECOMMENDED_VERSIONED_FILENAME
+        runtime_dir = self.data_dir / "onnxruntime"
+        candidates = (runtime_dir / folder / filename for folder in ("lib", "bin", ""))
+        runtime = next((path for path in candidates if path.is_file()), None)
+        dictionary = self.data_dir / "dict" / "open_jtalk_dic_utf_8-1.11"
+        if runtime is None or not dictionary.is_dir():
+            raise RuntimeError(
+                f"ONNX RuntimeまたはOpen JTalk辞書が見つかりません ({self.data_dir})。"
+                "uv run setup_voicevox.py を実行してください。"
+            )
+        try:
+            self.synthesizer = self.synthesizer_type(
+                self.onnxruntime.load_once(filename=str(runtime)),
+                self.open_jtalk(dictionary),
+                acceleration_mode="CPU",
+            )
+        except self.runtime_errors as error:
+            raise RuntimeError(f"VOICEVOX Coreの初期化に失敗しました。{error}") from error
+        for path in dict.fromkeys(self.model_paths[speaker] for speaker in speakers):
+            try:
+                with self.voice_model_file.open(path) as model:
+                    self.synthesizer.load_voice_model(model)
+            except self.model_errors as error:
+                raise RuntimeError(f"音声モデルを読み込めません ({path})。{error}") from error
+
+    def synthesize(self, speaker, speed, text, *, pad_start=True, pad_end=True):
+        try:
+            query = self.synthesizer.create_audio_query(text, speaker)
+            query.speed_scale = speed
+            query.output_sampling_rate = CORE_SAMPLE_RATE
+            query.output_stereo = False
+            query.pre_phoneme_length = 0.06 if pad_start else 0.0
+            query.post_phoneme_length = 0.16 if pad_end else 0.0
+            return self.synthesizer.synthesis(query, speaker)
+        except self.synthesis_errors as error:
+            raise RuntimeError(f"話者ID {speaker} の音声合成に失敗しました。{error}") from error
+
+
 def write_silence(episode, frames):
     block = bytes(min(frames, SAMPLE_RATE) * 2)
     whole_seconds, remainder = divmod(frames, SAMPLE_RATE)
@@ -167,7 +249,20 @@ def write_silence(episode, frames):
         episode.writeframesraw(block[:remainder * 2])
 
 
-def write_episode(output, actions, engine, speed, credit):
+def resample_core_audio(frames):
+    try:
+        from audioop import ratecv
+    except ImportError as error:
+        raise RuntimeError("音声のサンプルレート変換を準備できません。uv run setup_voicevox.py を実行してください。") from error
+    # audioop expects native byte order. Core and the output WAV use little-endian PCM.
+    if sys.byteorder == "big":
+        from audioop import byteswap
+        frames = byteswap(frames, 2)
+    frames, _ = ratecv(frames, 2, 1, CORE_SAMPLE_RATE, SAMPLE_RATE, None)
+    return byteswap(frames, 2) if sys.byteorder == "big" else frames
+
+
+def write_episode(output, actions, synthesize, speed, credit):
     temporary = None
     try:
         with tempfile.NamedTemporaryFile(
@@ -182,18 +277,19 @@ def write_episode(output, actions, engine, speed, credit):
                         continue
                     print(f"区間 {index + 1}/{len(actions)} を音声合成", file=sys.stderr)
                     audio = synthesize(
-                        engine, action.speaker, speed, action.text,
+                        action.speaker, speed, action.text,
                         pad_start=index == 0 or not isinstance(actions[index - 1], Silence),
                         pad_end=index + 1 == len(actions) or not isinstance(actions[index + 1], Silence),
                     )
                     with wave.open(io.BytesIO(audio), "rb") as segment:
-                        audio_format = (
-                            segment.getnchannels(), segment.getsampwidth(), segment.getframerate()
-                        )
+                        sample_rate = segment.getframerate()
                         frames = segment.readframes(segment.getnframes())
-                        if (audio_format != (1, 2, SAMPLE_RATE) or not frames
+                        if (segment.getnchannels() != 1 or segment.getsampwidth() != 2
+                                or sample_rate not in (SAMPLE_RATE, CORE_SAMPLE_RATE) or not frames
                                 or len(frames) != segment.getnframes() * 2):
                             raise ValueError(f"区間 {index + 1} のWAVが空か、形式が異なります。")
+                        if sample_rate == CORE_SAMPLE_RATE:
+                            frames = resample_core_audio(frames)
                         if action.paragraph_pause:
                             write_silence(episode, round(SAMPLE_RATE * 0.35))
                         episode.writeframesraw(frames)
@@ -212,7 +308,9 @@ def main():
     )
     parser.add_argument("script", nargs="?", help="UTF-8原稿のパス。- は標準入力")
     parser.add_argument("output", nargs="?", type=Path, help="WAVのパス。省略時は原稿と同名")
-    parser.add_argument("--engine", default="http://127.0.0.1:50021", help="VOICEVOX EngineのURL")
+    backend = parser.add_mutually_exclusive_group()
+    backend.add_argument("--core-dir", type=Path, default=DEFAULT_CORE_DIR, help="VOICEVOX Coreのデータディレクトリ")
+    backend.add_argument("--engine", help="既存のVOICEVOX EngineのURLを指定して使用")
     parser.add_argument("--speaker", type=int, default=2, help="話者スタイルID。既定値は2")
     parser.add_argument(
         "--voice", action="append", type=voice_assignment, default=[], metavar="ラベル=ID",
@@ -229,7 +327,8 @@ def main():
 
     try:
         if args.list_speakers:
-            for style_id, name in sorted(fetch_speakers(args.engine).items()):
+            speakers = fetch_speakers(args.engine) if args.engine else CoreVoice(args.core_dir).speakers
+            for style_id, name in sorted(speakers.items()):
                 print(f"{style_id}\t{name}")
             return 0
         script = (
@@ -250,16 +349,28 @@ def main():
             raise ValueError("出力ファイルの拡張子は .wav にしてください。")
         if args.script != "-" and output.resolve() == Path(args.script).resolve():
             raise ValueError("原稿と異なる出力先を指定してください。")
-        speakers = fetch_speakers(args.engine) if used_speakers else {}
+        speakers = {}
+        core = None
+        synthesize = None
+        if used_speakers:
+            if args.engine:
+                speakers = fetch_speakers(args.engine)
+                synthesize = partial(synthesize_with_engine, args.engine)
+            else:
+                core = CoreVoice(args.core_dir)
+                speakers = core.speakers
+                synthesize = core.synthesize
         for speaker in used_speakers:
             if speaker not in speakers:
                 raise ValueError(f"話者ID {speaker} は利用できません。--list-speakers で確認してください。")
+        if core is not None:
+            core.prepare(used_speakers)
         names = dict.fromkeys(speakers[speaker].split("（", 1)[0] for speaker in used_speakers)
         if args.credit and used_speakers:
             text = f"音声合成は、ボイスボックスの、{'、'.join(names)}を使用しました。"
             actions.append(Speech(text, isinstance(actions[-1], Speech), used_speakers[0]))
         credit = "、".join(speakers[speaker] for speaker in used_speakers)
-        write_episode(output, actions, args.engine, args.speed, credit)
+        write_episode(output, actions, synthesize, args.speed, credit)
         return 0
     except (OSError, ValueError, RuntimeError, EOFError, wave.Error) as error:
         print(f"エラー　{error}", file=sys.stderr)

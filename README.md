@@ -1,33 +1,23 @@
 # text2wav
 
-UTF-8の日本語原稿をVOICEVOXで読み上げ、ポッドキャスト用のWAVファイル1本に変換するコマンドラインツールです。長い原稿は文や段落の区切りを優先して分割し、段落間に短い間を入れます。
+UTF-8の日本語原稿をVOICEVOX Coreで読み上げ、ポッドキャスト用のWAVファイル1本に変換するコマンドラインツールです。VOICEVOXのアプリやサーバーを起動せずに、ローカルで音声を合成します。
 
-## 準備
+## 初回セットアップ
 
-1. Python 3.8以上を用意します。Pythonの追加パッケージは不要です。
-2. [VOICEVOX](https://voicevox.hiroshiba.jp/)または[VOICEVOX Engine](https://github.com/VOICEVOX/voicevox_engine)を起動します。既定の接続先は `http://127.0.0.1:50021` です。
-3. 読み上げる文章をUTF-8の `script.txt` に保存します。話題の区切りには空行を入れます。
+[uv](https://docs.astral.sh/uv/) を用意し、リポジトリのディレクトリで実行します。対応環境はWindows x64、macOS x64・Arm64、Linux x64・Arm64（glibc 2.34以上）です。Pythonは3.10以上を使用します。
 
-### `script.txt` の例
-
-次の文章をコピーし、`text2wav.py` と同じディレクトリに `script.txt` として保存します。
-
-```text
-こんにちは。週刊テックニュースのサンプルです。今日は、ゲーム開発とパソコンの省電力についてお話しします。
-
-まずは、ゲーム開発です。ユニティでゲームを作るときは、エディターでの動作確認に加えて、実際に遊ぶ端末でも試してみましょう。キーボードとゲームパッドを切り替えると、操作の案内が正しく切り替わるか確認できます。
-
-続いて、パソコンの省電力です。同じ処理でも、短時間で終わる設定と、実行中の電力が低い設定とでは、使うエネルギーが変わります。比べるときは、処理が終わるまでの時間と、使ったエネルギーの両方を測ってみましょう。
-
-以上、週刊テックニュースのサンプルでした。それでは、また次回。
+```sh
+uv run --python ">=3.10" setup_voicevox.py
 ```
+
+初回はインターネット接続が必要です。公式ダウンローダーが表示する利用規約を確認し、同意する場合は画面の指示に従ってください。セットアップは [VOICEVOX Core 0.17.1](https://github.com/VOICEVOX/voicevox_core/releases/tag/0.17.1) と変換用の依存パッケージを `.venv/` にインストールし、CPU用のランタイム・辞書・トーク用モデルを `voicevox_core/` に配置します。セットアップ後はオフラインで変換できます。
 
 ## 使い方
 
-リポジトリのディレクトリで実行します。
+同梱の [script.txt](script.txt) には、話者切り替えと無音のコマンドが含まれています。自分の原稿を使う場合は、UTF-8で保存してください。
 
 ```sh
-python text2wav.py script.txt
+uv run text2wav.py script.txt
 ```
 
 `script.txt` と同じディレクトリに `script.wav` が生成されます（モノラル、44.1 kHz、16-bit PCM）。
@@ -35,13 +25,13 @@ python text2wav.py script.txt
 出力先、話者、速度を指定する例です。出力先にディレクトリを指定する場合は、先に作成してください。
 
 ```sh
-python text2wav.py script.txt episode.wav --speaker 2 --speed 1.05
+uv run text2wav.py script.txt episode.wav --speaker 2 --speed 1.05
 ```
 
 話者スタイルIDは次のコマンドで確認できます。
 
 ```sh
-python text2wav.py --list-speakers
+uv run text2wav.py --list-speakers
 ```
 
 ## 原稿で話者と無音を指定する
@@ -72,7 +62,7 @@ python text2wav.py --list-speakers
 `--voice` を使うと、既定の割り当てを変更したり、`《司会》` のような独自の名前を使ったりできます。以前の `【男1】：` 形式を使った原稿は `《男1》` 形式に書き換えてください。
 
 ```sh
-python text2wav.py script.txt --voice "司会=11" --voice "解説=8"
+uv run text2wav.py script.txt --voice "司会=11" --voice "解説=8"
 ```
 
 ## 標準入力で渡す
@@ -80,14 +70,15 @@ python text2wav.py script.txt --voice "司会=11" --voice "解説=8"
 Bashなどでは、原稿をUTF-8の標準入力から渡せます。入力に `-` を指定し、出力先を省略すると `podcast.wav` が生成されます。
 
 ```sh
-python text2wav.py - episode.wav < script.txt
+uv run text2wav.py - episode.wav < script.txt
 ```
 
 ## オプション
 
 | オプション | 説明 |
 | --- | --- |
-| `--engine URL` | VOICEVOX Engineの接続先を指定 |
+| `--core-dir パス` | VOICEVOX Coreのデータディレクトリを指定 |
+| `--engine URL` | すでに起動しているVOICEVOX Engineを明示的に使用 |
 | `--speaker ID` | 原稿の冒頭でラベルがない文章に使う話者スタイルID。既定値は `2` |
 | `--voice ラベル=ID` | 話者ラベルの割り当てを追加・変更。複数指定可 |
 | `--speed 倍率` | 読み上げ速度を `0.5`〜`2.0` で指定。既定値は `1.0` |

@@ -1,0 +1,4 @@
+/.venv/
+/voicevox_core/
+/__pycache__/
+/*.wav
